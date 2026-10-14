@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebAuthn iPhone Cross-RP Test</title>
+<style>
+body {font-family:system-ui,sans-serif;max-width:940px;margin:2rem auto;padding:0 1rem;line-height:1.5}
+button {padding:.7rem;margin:0 .4rem .6rem 0;cursor:pointer}
+pre {background:#161b22;color:#d1e7dd;padding:1rem;white-space:pre-wrap;overflow-wrap:anywhere;border-radius:8px}
+</style>
+</head>
+<body>
+<h2>WebAuthn: реальный тест passkey на iPhone</h2>
+<p>Используйте только новый тестовый passkey. Приватный ключ не извлекается. RP регистрации: <code id="rp-label"></code>; чужой RP: <code>example.com</code>.</p><p><strong>Ограничение:</strong> если Safari выдаёт <code>SecurityError</code>, отказ произошёл на уровне браузера и запрос мог не дойти до аутентификатора.</p>
+<button id="register">1. Зарегистрировать тестовый passkey</button>
+<button id="normal">2. Контрольная подпись (свой RP)</button>
+<button id="foreign">3. Попытаться подписать для example.com</button>
+<button id="save">4. Сохранить результаты JSON</button>
+<pre id="log">Откройте эту страницу по HTTPS в Safari на iPhone.</pre>
+<script>
+'use strict';
+const REGISTERED_RP = location.hostname;
+const FOREIGN_RP = 'example.com';
+const STORE = 'cross-rp-probe-credential-v2:' + REGISTERED_RP;
+document.getElementById('rp-label').textContent = REGISTERED_RP;
+const evidence = {origin: location.origin, registrationRpId: REGISTERED_RP, foreignRpId: FOREIGN_RP, events: []};
+const logElement = document.getElementById('log');
+function write(message, data) {
+  const line = `${new Date().toISOString()} ${message}${data ? '\n' + JSON.stringify(data, null, 2) : ''}`;
+  logElement.textContent += '\n\n' + line;
+  console.log(message, data || '');
+  evidence.events.push({time: new Date().toISOString(), message, data: data || null});
+}
+function randomBytes(n) { return crypto.getRandomValues(new Uint8Array(n)); }
+function asBytes(b) { return new Uint8Array(b); }
+function toBase64url(b) {
+  const bytes = asBytes(b);
+  let s = '';
+  for (const x of bytes) s += String.fromCharCode(x);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function fromBase64url(s) {
+  const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - s.length % 4) % 4));
+  return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+function toHex(b) { return [...asBytes(b)].map(x => x.toString(16).padStart(2, '0')).join(''); }
+async function sha256(b) { return asBytes(await crypto.subtle.digest('SHA-256', b)); }
+function concat(a, b) { const z = new Uint8Array(a.length + b.length); z.set(a); z.set(b, a.length); return z; }
+// Convert the DER-encoded WebAuthn ES256 signature to the 64-byte P1363 format WebCrypto verifies.
+function derToP1363(der) {
+  const a = asBytes(der);
+  let i = 0;
+  if (a[i++] !== 0x30) throw Error('Not ASN.1 SEQUENCE');
+  let len = a[i++];
+  if (len & 0x80) { const count = len & 0x7f; len = 0; for (let j = 0; j < count; j++) len = len * 256 + a[i++]; }
+  if (len !== a.length - i) throw Error('Bad DER length');
+  const readInt = () => {
+    if (a[i++] !== 0x02) throw Error('Expected INTEGER');
+    let n = a[i++];
+    let v = a.slice(i, i + n); i += n;
+    while (v.length > 0 && v[0] === 0) v = v.slice(1);
+    if (v.length > 32) throw Error('ECDSA integer too long');
+    const result = new Uint8Array(32);
+    result.set(v, 32 - v.length);
+    return result;
+  };
+  const r = readInt();
+  const s = readInt();
+  if (i !== a.length) throw Error('Trailing data in signature');
+  return concat(r, s);
+}
+async function register() {
+  try {
+    if (!window.isSecureContext || !location.hostname) throw Error('Откройте страницу по HTTPS');
+    if (!navigator.credentials?.create) throw Error('WebAuthn не поддерживается в этом браузере');
+    const userId = randomBytes(16);
+    const pk = {
+      challenge: randomBytes(32),
+      rp: {id: REGISTERED_RP, name: 'Local Security Research'},
+      user: {id: userId, name: 'local-researcher', displayName: 'Local Researcher'},
+      pubKeyCredParams: [{type: 'public-key', alg: -7}],
+      authenticatorSelection: {residentKey: 'preferred', userVerification: 'preferred'},
+      attestation: 'none', timeout: 60000
+    };
+    const credential = await navigator.credentials.create({publicKey: pk});
+    if (!credential) throw Error('No credential returned');
+    const publicKeySpki = credential.response.getPublicKey?.();
+    const row = {
+      rpId: REGISTERED_RP,
+      credentialId: toBase64url(credential.rawId),
+      publicKeySpki: publicKeySpki ? toBase64url(publicKeySpki) : null,
+      algorithm: credential.response.getPublicKeyAlgorithm?.() ?? null
+    };
+    localStorage.setItem(STORE, JSON.stringify(row));
+    evidence.registration = row;
+    write('REGISTERED: новый тестовый passkey для ' + REGISTERED_RP, row);
+  } catch (e) { write(`REGISTRATION FAILED: ${e.name}: ${e.message}`); }
+}
+async function attempt(rpId) {
+  const label = rpId === REGISTERED_RP ? 'CONTROL' : 'FOREIGN';
+  try {
+    if (!window.isSecureContext) throw Error('Откройте страницу по HTTPS');
+    const saved = JSON.parse(localStorage.getItem(STORE) || 'null');
+    if (!saved) throw Error('Сначала зарегистрируйте тестовый passkey');
+    const challenge = randomBytes(32);
+    write(`${label}: запрашиваем authenticator assertion`, {rpId, credentialId: saved.credentialId});
+    const credential = await navigator.credentials.get({
+      publicKey: {
+        challenge, rpId, timeout: 60000, userVerification: 'preferred',
+        allowCredentials: [{type: 'public-key', id: fromBase64url(saved.credentialId)}]
+      }
+    });
+    if (!credential) throw Error('No assertion returned');
+    const authData = asBytes(credential.response.authenticatorData);
+    const clientData = asBytes(credential.response.clientDataJSON);
+    const client = JSON.parse(new TextDecoder().decode(clientData));
+    const calculatedHash = toHex(await sha256(new TextEncoder().encode(rpId)));
+    const rpHashFromAuthenticator = toHex(authData.slice(0, 32));
+    const challengeMatches = client.challenge === toBase64url(challenge);
+    const originMatches = client.origin === location.origin;
+    const assertionTypeMatches = client.type === "webauthn.get";
+    const credentialMatches = toBase64url(credential.rawId) === saved.credentialId;
+    const rpHashMatches = rpHashFromAuthenticator === calculatedHash;
+    let verifiedByPublicKey = null;
+    if (saved.publicKeySpki) {
+      const pub = await crypto.subtle.importKey('spki', fromBase64url(saved.publicKeySpki),
+        {name: 'ECDSA', namedCurve: 'P-256'}, false, ['verify']);
+      const hash = await sha256(clientData);
+      const message = concat(authData, hash);
+      verifiedByPublicKey = await crypto.subtle.verify(
+        {name: 'ECDSA', hash: 'SHA-256'}, pub, derToP1363(credential.response.signature), message
+      );
+    }
+    const result = {
+      rpIdRequested: rpId, credentialMatches, clientOrigin: client.origin,
+      originMatches, assertionTypeMatches, challengeMatches, rpHashFromAuthenticator, calculatedHash, rpHashMatches,
+      verifiedByPublicKey, authenticatorData: toBase64url(authData),
+      clientDataJSON: toBase64url(clientData), signatureDER: toBase64url(credential.response.signature)
+    };
+    write(`${label} SIGNATURE RECEIVED`, result);
+    if (label === 'CONTROL') {
+      const verified = credentialMatches && originMatches && assertionTypeMatches && challengeMatches && rpHashMatches && verifiedByPublicKey === true;
+      write(verified ? 'CONTROL PASS: действительная подпись нового passkey' : 'CONTROL INCOMPLETE: проверьте поля подписи, null означает отсутствие проверки ключом');
+    }
+    if (rpId === FOREIGN_RP && credentialMatches && challengeMatches && originMatches && assertionTypeMatches && rpHashMatches && verifiedByPublicKey === true) {
+      write('POTENTIAL CROSS-RP AUTHENTICATOR FAILURE: подпись чужого RP получена тем же ключом');
+    }
+  } catch (e) {
+    write(`${label} BLOCKED / NOT PROVEN: ${e.name}: ${e.message}`);
+    if (label === 'FOREIGN' && e.name === 'SecurityError') write('EXPECTED: браузер запретил чужой RP до получения подписи');
+  }
+}
+function saveEvidence() {
+  const json = JSON.stringify(evidence, null, 2);
+  const url = URL.createObjectURL(new Blob([json], {type: 'application/json'}));
+  const a = document.createElement('a');
+  a.href = url; a.download = 'webauthn-cross-rp-results.json'; a.click();
+  URL.revokeObjectURL(url);
+}
+document.getElementById('register').onclick = register;
+document.getElementById('normal').onclick = () => attempt(REGISTERED_RP);
+document.getElementById('foreign').onclick = () => attempt(FOREIGN_RP);
+document.getElementById('save').onclick = saveEvidence;
+</script>
+</body>
+</html>
